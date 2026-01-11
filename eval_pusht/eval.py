@@ -541,7 +541,7 @@ def main():
     parser.add_argument("--dataset-start-episode", type=int, default=0)
     parser.add_argument("--dataset-repo-id", type=str, default="lerobot/pusht_image")
     parser.add_argument("--debug", action="store_true", help="Debug mode: run 1 action chunk only")
-    parser.add_argument("--seed", type=int, default=0, help="Random seed for reproducibility")
+    parser.add_argument("--seed", type=int, default=9999, help="Random seed for reproducibility")
 
     args = parser.parse_args()
 
