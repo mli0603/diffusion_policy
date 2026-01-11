@@ -270,10 +270,12 @@ def run_episode(
 ) -> dict:
     """Run a single episode."""
     
+    # Always reset server state at start of episode
+    client.reset_episode(dataset_episode_idx if dataset_episode_idx is not None else 0)
+    
     # Get initial state from dataset
     initial_state = None
     if dataset_episode_idx is not None and dataset_helper:
-        client.reset_episode(dataset_episode_idx)
         initial_state = dataset_helper.get_initial_state(dataset_episode_idx)
         print(f"[REPLAY] Episode {dataset_episode_idx} initial state (agent_pos): {initial_state}")
 
@@ -319,7 +321,8 @@ def run_episode(
 
         # Get action chunk from server
         delta_actions, video_frames = client.get_action_chunk(obs_img)
-        server_frames.extend(video_frames)
+        # Skip the first frame (input image) as it duplicates the observation
+        chunk_server_frames = video_frames[1:] if video_frames else []
         print(f"[Step {step}] Received {len(delta_actions)} actions from server (request #{request_count})")
         
         # Store agent position at chunk start - this is the reference for all deltas
@@ -342,6 +345,10 @@ def run_episode(
             # Record frame
             frame = env.render("rgb_array")
             frames.append(frame)
+            
+            # Add corresponding server frame (1:1 with rollout frames)
+            if i < len(chunk_server_frames):
+                server_frames.append(chunk_server_frames[i])
             
             # Get corresponding dataset frame for comparison
             if dataset_helper and dataset_episode_idx is not None:
@@ -412,11 +419,6 @@ def evaluate(
     seed: Optional[int] = None,
 ):
     """Run evaluation."""
-    # Set seed for reproducibility
-    if seed is not None:
-        set_seed(seed)
-        print(f"Random seed set to: {seed}")
-
     # Create original diffusion_policy environment
     env = PushTEnv(legacy=True, render_size=96)
 
@@ -448,6 +450,12 @@ def evaluate(
 
     try:
         for episode_idx in range(num_episodes):
+            # Set different seed for each episode for variety while maintaining reproducibility
+            if seed is not None:
+                episode_seed = seed + episode_idx
+                set_seed(episode_seed)
+                env.seed(episode_seed)  # Seed environment's internal RNG
+
             dataset_episode_idx = None
             if replay_dataset:
                 dataset_episode_idx = dataset_start_episode + episode_idx
@@ -464,21 +472,6 @@ def evaluate(
 
                 if result["success"]:
                     successes += 1
-
-                # Save rollout video (all frames from every step)
-                if result.get("frames"):
-                    video_path = output_path / f"episode_{episode_idx:03d}_rollout.mp4"
-                    save_video(result["frames"], str(video_path))
-
-                # Save dataset video for comparison
-                if result.get("dataset_frames"):
-                    video_path = output_path / f"episode_{episode_idx:03d}_dataset.mp4"
-                    save_video(result["dataset_frames"], str(video_path))
-
-                # Save server video (frames returned by server)
-                if result.get("server_frames"):
-                    video_path = output_path / f"episode_{episode_idx:03d}_server.mp4"
-                    save_video(result["server_frames"], str(video_path))
 
                 # Save combined video (env | model) side by side
                 if result.get("frames") and result.get("server_frames"):
