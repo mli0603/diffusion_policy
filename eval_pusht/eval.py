@@ -89,7 +89,7 @@ class SimpleInferenceClient:
             pass
         return {}
 
-    def get_action_chunk(self, image: np.ndarray) -> tuple[np.ndarray, list[np.ndarray]]:
+    def get_action_chunk(self, image: np.ndarray, prompt: str = "PushT task") -> tuple[np.ndarray, list[np.ndarray]]:
         """Get action chunk from server.
         
         Returns:
@@ -113,7 +113,7 @@ class SimpleInferenceClient:
             self.server_url,
             json={
                 "image": encoded,
-                "prompt": "PushT task",
+                "prompt": prompt,
                 "domain_name": "pusht",
                 "image_size": 96,
             },
@@ -267,6 +267,7 @@ def run_episode(
     dataset_episode_idx: Optional[int] = None,
     dataset_helper: Optional[DatasetReplayHelper] = None,
     debug_mode: bool = False,
+    augment_prompt: bool = False,
 ) -> dict:
     """Run a single episode."""
     
@@ -310,6 +311,12 @@ def run_episode(
     request_count = 0
     frame_idx = 0
 
+    # Determine prompt
+    if augment_prompt:
+        prompt = "You are given a task to push the green T into the yellow T region. Current prediction mode is policy. The video is 1.6 seconds long and is of 10 FPS."
+    else:
+        prompt = "PushT task"
+
     while step < max_steps:
         agent_pos = obs[:2]
 
@@ -320,7 +327,7 @@ def run_episode(
         request_count += 1
 
         # Get action chunk from server
-        delta_actions, video_frames = client.get_action_chunk(obs_img)
+        delta_actions, video_frames = client.get_action_chunk(obs_img, prompt=prompt)
         # Skip the first frame (input image) as it duplicates the observation
         chunk_server_frames = video_frames[1:] if video_frames else []
         print(f"[Step {step}] Received {len(delta_actions)} actions from server (request #{request_count})")
@@ -417,6 +424,7 @@ def evaluate(
     dataset_repo_id: str = "lerobot/pusht_image",
     debug_mode: bool = False,
     seed: Optional[int] = None,
+    augment_prompt: bool = False,
 ):
     """Run evaluation."""
     # Create original diffusion_policy environment
@@ -468,6 +476,7 @@ def evaluate(
                     dataset_episode_idx=dataset_episode_idx,
                     dataset_helper=dataset_helper,
                     debug_mode=debug_mode,
+                    augment_prompt=augment_prompt,
                 )
 
                 if result["success"]:
@@ -542,6 +551,7 @@ def main():
     parser.add_argument("--dataset-repo-id", type=str, default="lerobot/pusht_image")
     parser.add_argument("--debug", action="store_true", help="Debug mode: run 1 action chunk only")
     parser.add_argument("--seed", type=int, default=9999, help="Random seed for reproducibility")
+    parser.add_argument("--augment-prompt", action="store_true", help="Use augmented prompt with detailed task description")
 
     args = parser.parse_args()
 
@@ -555,6 +565,7 @@ def main():
         dataset_repo_id=args.dataset_repo_id,
         debug_mode=args.debug,
         seed=args.seed,
+        augment_prompt=args.augment_prompt,
     )
 
 
