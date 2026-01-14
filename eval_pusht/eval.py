@@ -31,6 +31,7 @@ Run with:
     python -m eval_pusht.eval --server-url http://localhost:8000/predict --replay-dataset
     python -m eval_pusht.eval --server-url http://localhost:8000/predict --num-episodes 1 --debug
     python -m eval_pusht.eval --server-url http://localhost:8000/predict --num-episodes 10
+    python -m eval_pusht.eval --server-url http://localhost:8000/predict --num-episodes 10 --num-rollouts 10
 """
 
 import argparse
@@ -65,6 +66,7 @@ class SimpleInferenceClient:
         self.action_norm_range = action_norm_range
         self.timeout = timeout
         self.session = requests.Session()
+        self.image_size = 96  # Default image size, can be changed to 256 for res256 models
 
     def get_server_info(self) -> dict:
         try:
@@ -103,6 +105,11 @@ class SimpleInferenceClient:
         if image.dtype != np.uint8:
             image = (image * 255).astype(np.uint8) if image.max() <= 1.0 else image.astype(np.uint8)
         pil_image = Image.fromarray(image)
+        
+        # Upsample to target image_size if needed (e.g., 96 -> 256 for res256 models)
+        if self.image_size != pil_image.size[0]:
+            pil_image = pil_image.resize((self.image_size, self.image_size), Image.Resampling.BILINEAR)
+        
         buffer = io.BytesIO()
         pil_image.save(buffer, format="PNG")
         buffer.seek(0)
@@ -115,7 +122,7 @@ class SimpleInferenceClient:
                 "image": encoded,
                 "prompt": prompt,
                 "domain_name": "pusht",
-                "image_size": 96,
+                "image_size": self.image_size,
             },
             timeout=self.timeout,
         )
@@ -425,8 +432,9 @@ def evaluate(
     debug_mode: bool = False,
     seed: Optional[int] = None,
     augment_prompt: bool = False,
+    num_rollouts: int = 10,
 ):
-    """Run evaluation."""
+    """Run evaluation with multiple rollouts per episode for robustness."""
     # Create original diffusion_policy environment
     env = PushTEnv(legacy=True, render_size=96)
 
@@ -442,11 +450,19 @@ def evaluate(
     server_info = client.get_server_info()
     checkpoint_info = server_info.get("checkpoint", "")
     run_name = server_info.get("run_name", "diffusion_policy_eval")
+    
+    # Check if model uses 256 resolution based on run_name or checkpoint
+    model_identifier = f"{run_name}_{checkpoint_info}".lower()
+    if "res256" in model_identifier:
+        client.image_size = 256
+        print(f"[INFO] Detected res256 model, upsampling images to 256x256")
+    
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_path = Path(output_dir) / f"{run_name}_{timestamp}"
     output_path.mkdir(parents=True, exist_ok=True)
 
-    print(f"Starting evaluation: {num_episodes} episodes")
+    print(f"Starting evaluation: {num_episodes} episodes x {num_rollouts} rollouts")
+    print(f"Image size: {client.image_size}x{client.image_size}")
     print(f"Server URL: {server_url}")
     print(f"Output directory: {output_path}")
     print(f"Using original diffusion_policy environment")
@@ -454,75 +470,113 @@ def evaluate(
     print("-" * 50)
 
     results = []
-    successes = 0
+    total_successes = 0
+    total_rollouts = 0
 
     try:
         for episode_idx in range(num_episodes):
-            # Set different seed for each episode for variety while maintaining reproducibility
-            if seed is not None:
-                episode_seed = seed + episode_idx
-                set_seed(episode_seed)
-                env.seed(episode_seed)  # Seed environment's internal RNG
-
             dataset_episode_idx = None
             if replay_dataset:
                 dataset_episode_idx = dataset_start_episode + episode_idx
 
-            try:
-                result = run_episode(
-                    env=env,
-                    client=client,
-                    max_steps=max_steps,
-                    dataset_episode_idx=dataset_episode_idx,
-                    dataset_helper=dataset_helper,
-                    debug_mode=debug_mode,
-                    augment_prompt=augment_prompt,
-                )
+            episode_rollout_results = []
+            episode_successes = 0
 
-                if result["success"]:
-                    successes += 1
+            for rollout_idx in range(num_rollouts):
+                # Set different seed for each rollout while maintaining reproducibility
+                if seed is not None:
+                    rollout_seed = seed + episode_idx * num_rollouts + rollout_idx
+                    set_seed(rollout_seed)
+                    env.seed(rollout_seed)  # Seed environment's internal RNG
 
-                # Save combined video (env | model) side by side
-                if result.get("frames") and result.get("server_frames"):
-                    combined_frames = concatenate_videos_horizontal(
-                        result["frames"], result["server_frames"]
+                try:
+                    result = run_episode(
+                        env=env,
+                        client=client,
+                        max_steps=max_steps,
+                        dataset_episode_idx=dataset_episode_idx,
+                        dataset_helper=dataset_helper,
+                        debug_mode=debug_mode,
+                        augment_prompt=augment_prompt,
                     )
-                    video_path = output_path / f"episode_{episode_idx:03d}_combined.mp4"
-                    save_video(combined_frames, str(video_path))
 
+                    if result["success"]:
+                        episode_successes += 1
+                        total_successes += 1
+                    total_rollouts += 1
+
+                    # Save combined video (env | model) side by side
+                    if result.get("frames") and result.get("server_frames"):
+                        combined_frames = concatenate_videos_horizontal(
+                            result["frames"], result["server_frames"]
+                        )
+                        video_path = output_path / f"episode_{episode_idx:03d}_rollout_{rollout_idx:02d}_combined.mp4"
+                        save_video(combined_frames, str(video_path))
+
+                    episode_rollout_results.append({
+                        "rollout": rollout_idx,
+                        "success": result["success"],
+                        "steps": result["steps"],
+                        "final_coverage": result["final_coverage"],
+                    })
+
+                    status = "SUCCESS" if result["success"] else "FAIL"
+                    print(
+                        f"Episode {episode_idx + 1}/{num_episodes}, Rollout {rollout_idx + 1}/{num_rollouts}: {status} | "
+                        f"Steps: {result['steps']} | Coverage: {result['final_coverage']:.2%}"
+                    )
+
+                except Exception as e:
+                    print(f"Episode {episode_idx + 1}, Rollout {rollout_idx + 1}: ERROR - {e}")
+                    import traceback
+                    traceback.print_exc()
+
+            # Aggregate rollout results for this episode
+            if episode_rollout_results:
+                coverages = [r["final_coverage"] for r in episode_rollout_results]
+                steps_list = [r["steps"] for r in episode_rollout_results]
+                episode_success_rate = episode_successes / len(episode_rollout_results)
+                
                 results.append({
                     "episode": episode_idx,
-                    "success": result["success"],
-                    "steps": result["steps"],
-                    "final_coverage": result["final_coverage"],
+                    "num_rollouts": len(episode_rollout_results),
+                    "success_rate": episode_success_rate,
+                    "successes": episode_successes,
+                    "mean_coverage": float(np.mean(coverages)),
+                    "std_coverage": float(np.std(coverages)),
+                    "min_coverage": float(np.min(coverages)),
+                    "max_coverage": float(np.max(coverages)),
+                    "mean_steps": float(np.mean(steps_list)),
+                    "std_steps": float(np.std(steps_list)),
+                    "rollouts": episode_rollout_results,
                 })
 
-                status = "SUCCESS" if result["success"] else "FAIL"
                 print(
-                    f"Episode {episode_idx + 1}/{num_episodes}: {status} | "
-                    f"Steps: {result['steps']} | Coverage: {result['final_coverage']:.2%}"
+                    f"  >> Episode {episode_idx + 1} Summary: "
+                    f"Success Rate: {episode_success_rate:.1%} | "
+                    f"Coverage: {np.mean(coverages):.2%} ± {np.std(coverages):.2%}"
                 )
-
-            except Exception as e:
-                print(f"Episode {episode_idx + 1}: ERROR - {e}")
-                import traceback
-                traceback.print_exc()
 
     finally:
         client.close()
 
     # Summary
-    success_rate = successes / num_episodes if num_episodes > 0 else 0
-    avg_coverage = sum(r["final_coverage"] for r in results) / len(results) if results else 0
+    overall_success_rate = total_successes / total_rollouts if total_rollouts > 0 else 0
+    all_coverages = [r["mean_coverage"] for r in results] if results else []
+    avg_coverage = np.mean(all_coverages) if all_coverages else 0
+    std_coverage = np.std(all_coverages) if all_coverages else 0
 
     # Save results to JSON
     summary = {
         "domain_name": "pusht",
         "image_size": 96,
         "num_episodes": num_episodes,
-        "success_rate": success_rate,
-        "avg_coverage": avg_coverage,
-        "successes": successes,
+        "num_rollouts_per_episode": num_rollouts,
+        "total_rollouts": total_rollouts,
+        "overall_success_rate": overall_success_rate,
+        "total_successes": total_successes,
+        "avg_coverage": float(avg_coverage),
+        "std_coverage": float(std_coverage),
         "seed": seed,
         "server_url": server_url,
         "max_steps": max_steps,
@@ -534,8 +588,8 @@ def evaluate(
         json.dump(summary, f, indent=2)
 
     print("-" * 50)
-    print(f"Success rate: {success_rate:.2%}")
-    print(f"Average coverage: {avg_coverage:.2%}")
+    print(f"Overall Success Rate: {overall_success_rate:.2%} ({total_successes}/{total_rollouts})")
+    print(f"Average Coverage: {avg_coverage:.2%} ± {std_coverage:.2%}")
     print(f"Results saved to: {output_path}")
     print(f"JSON results: {json_path}")
 
@@ -544,6 +598,7 @@ def main():
     parser = argparse.ArgumentParser(description="Eval with original diffusion_policy env")
     parser.add_argument("--server-url", type=str, required=True)
     parser.add_argument("--num-episodes", type=int, default=1)
+    parser.add_argument("--num-rollouts", type=int, default=10, help="Number of rollouts per episode for robustness")
     parser.add_argument("--max-steps", type=int, default=300)
     parser.add_argument("--output-dir", type=str, default="eval_results")
     parser.add_argument("--replay-dataset", action="store_true")
@@ -566,6 +621,7 @@ def main():
         debug_mode=args.debug,
         seed=args.seed,
         augment_prompt=args.augment_prompt,
+        num_rollouts=args.num_rollouts,
     )
 
 
