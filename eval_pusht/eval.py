@@ -12,7 +12,7 @@ Server API:
       "image_size": <int>             # e.g., 96
     }
   - Output: {
-      "action": [[a0_0, a0_1, ...], ..., [aN_0, aN_1, ...]],  # (N, D) normalized deltas in [-1, 1]
+      "action": [[a0_0, a0_1, ...], ..., [aN_0, aN_1, ...]],  # (N, D) normalized in [-1, 1]
       "video": ["<base64_png>", ...]  # List of T base64-encoded PNG frames (optional)
     }
 
@@ -32,6 +32,9 @@ Run with:
     python -m eval_pusht.eval --server-url http://localhost:8000/predict --num-episodes 1 --debug
     python -m eval_pusht.eval --server-url http://localhost:8000/predict --num-episodes 10
     python -m eval_pusht.eval --server-url http://localhost:8000/predict --num-episodes 10 --num-rollouts 10
+
+    # For UVA models that predict absolute states (not deltas):
+    python -m eval_pusht.eval --server-url http://localhost:8000/predict --action-space absolute --direct-pos --num-episodes 10
 """
 
 import argparse
@@ -60,13 +63,15 @@ from diffusion_policy.env.pusht.pusht_env import PushTEnv
 class SimpleInferenceClient:
     """Simple inference client for the mock server."""
 
-    def __init__(self, server_url: str, action_norm_range: float = 512.0, timeout: float = 300.0):
+    def __init__(self, server_url: str, action_norm_range: float = 512.0, timeout: float = 300.0,
+                 action_space: str = "relative"):
         self.server_url = server_url
         self.base_url = server_url.rsplit("/", 1)[0]
         self.action_norm_range = action_norm_range
         self.timeout = timeout
         self.session = requests.Session()
         self.image_size = 96  # Default image size, can be changed to 256 for res256 models
+        self.action_space = action_space  # "relative" or "absolute"
 
     def get_server_info(self) -> dict:
         try:
@@ -95,7 +100,8 @@ class SimpleInferenceClient:
         """Get action chunk from server.
         
         Returns:
-            Tuple of (actions, video_frames) where video_frames is a list of decoded images
+            Tuple of (raw_actions, video_frames) where raw_actions are normalized in [-1, 1]
+            and video_frames is a list of decoded images.
         """
         import base64
         import io
@@ -148,10 +154,48 @@ class SimpleInferenceClient:
 
         return action, video_frames
 
-    def convert_to_absolute(self, delta: np.ndarray, agent_pos: np.ndarray) -> np.ndarray:
-        """Convert delta to absolute position."""
-        absolute = delta * self.action_norm_range + agent_pos
+    def wait_until_ready(self, timeout: float = 600.0, interval: float = 5.0) -> None:
+        """Wait for the model server health endpoint before starting rollouts."""
+        import time
+
+        deadline = time.time() + timeout
+        last_error = None
+        while time.time() < deadline:
+            try:
+                response = self.session.get(f"{self.base_url}/", timeout=min(interval, self.timeout))
+                if response.status_code == 200:
+                    return
+                last_error = f"HTTP {response.status_code}: {response.text[:200]}"
+            except Exception as exc:
+                last_error = str(exc)
+            time.sleep(interval)
+        raise TimeoutError(f"Server did not become ready within {timeout:.1f}s: {last_error}")
+
+    def to_env_action(self, raw_action: np.ndarray, agent_pos: np.ndarray) -> np.ndarray:
+        """Convert raw server output to absolute position for env.step().
+
+        For 'relative' action_space (default):
+            Server outputs normalized deltas in [-1, 1].
+            absolute = delta * norm_range + agent_pos
+
+        For 'absolute' action_space:
+            Server outputs normalized absolute positions in [-1, 1].
+            absolute = (raw + 1) / 2 * norm_range
+            (agent_pos is NOT used — the prediction IS the target position.)
+        """
+        if self.action_space == "absolute":
+            # PushT absolute coordinates are normalized as action / 512 * 2 - 1
+            # during training, so invert that affine transform for the env.
+            absolute = (raw_action + 1.0) * 0.5 * self.action_norm_range
+        else:
+            # Server predicts relative delta from agent_pos.
+            absolute = raw_action * self.action_norm_range + agent_pos
         return np.clip(absolute, 0, self.action_norm_range)
+
+    # Keep old name for backward compatibility
+    def convert_to_absolute(self, delta: np.ndarray, agent_pos: np.ndarray) -> np.ndarray:
+        """Legacy wrapper — use to_env_action() instead."""
+        return self.to_env_action(delta, agent_pos)
 
     def close(self):
         self.session.close()
@@ -231,6 +275,13 @@ def save_video(frames: list, output_path: str, fps: int = 10):
     )
 
 
+def save_gif(frames: list, output_path: str, fps: int = 10):
+    """Save frames as GIF video."""
+    if not frames:
+        return
+    imageio.mimsave(output_path, frames, fps=fps)
+
+
 def concatenate_videos_horizontal(frames1: list, frames2: list) -> list:
     """Concatenate two frame lists horizontally.
     
@@ -275,9 +326,15 @@ def run_episode(
     dataset_helper: Optional[DatasetReplayHelper] = None,
     debug_mode: bool = False,
     augment_prompt: bool = False,
+    direct_pos: bool = False,
 ) -> dict:
-    """Run a single episode."""
-    
+    """Run a single episode.
+
+    Args:
+        direct_pos: If True, use env.step_direct() to bypass PID controller.
+                    Use when the model predicts target states (positions).
+    """
+
     # Always reset server state at start of episode
     client.reset_episode(dataset_episode_idx if dataset_episode_idx is not None else 0)
     
@@ -307,6 +364,8 @@ def run_episode(
         obs = env.reset()
 
     print(f"[ENV] After reset - agent: {obs[:2]}, block: {obs[2:4]}, angle: {obs[4]:.4f}")
+    step_fn_name = "step_direct" if direct_pos else "step"
+    print(f"[ENV] Action space: {client.action_space} | Step mode: {step_fn_name}")
 
     frames = []
     obs_frames = []
@@ -317,6 +376,9 @@ def run_episode(
     success = False
     request_count = 0
     frame_idx = 0
+
+    # Select the step function
+    step_fn = env.step_direct if direct_pos else env.step
 
     # Determine prompt
     if augment_prompt:
@@ -333,28 +395,25 @@ def run_episode(
 
         request_count += 1
 
-        # Get action chunk from server
-        delta_actions, video_frames = client.get_action_chunk(obs_img, prompt=prompt)
+        # Get action chunk from server (raw normalized actions in [-1, 1])
+        raw_actions, video_frames = client.get_action_chunk(obs_img, prompt=prompt)
         # Skip the first frame (input image) as it duplicates the observation
         chunk_server_frames = video_frames[1:] if video_frames else []
-        print(f"[Step {step}] Received {len(delta_actions)} actions from server (request #{request_count})")
+        print(f"[Step {step}] Received {len(raw_actions)} actions from server (request #{request_count})")
         
-        # Store agent position at chunk start - this is the reference for all deltas
+        # Store agent position at chunk start — used as reference for relative deltas
         chunk_start_agent_pos = agent_pos.copy()
-        
 
         # Execute all actions in chunk
-        for i, delta in enumerate(delta_actions):
+        for i, raw in enumerate(raw_actions):
             
-            # Convert delta to absolute using chunk_start_agent_pos (the reference position)
-            action = client.convert_to_absolute(delta, chunk_start_agent_pos)
-            
+            # Convert raw server output → absolute env position
+            action = client.to_env_action(raw, chunk_start_agent_pos)
 
-            # Step environment
-            obs, reward, done, info = env.step(action)
+            # Step environment (PID or direct depending on flag)
+            obs, reward, done, info = step_fn(action)
             agent_pos = obs[:2]
             total_reward += reward
-
 
             # Record frame
             frame = env.render("rgb_array")
@@ -385,7 +444,7 @@ def run_episode(
         
         # Debug mode: exit after first action chunk
         if debug_mode:
-            print(f"[DEBUG] Executed {len(delta_actions)} actions from 1 request, exiting.")
+            print(f"[DEBUG] Executed {len(raw_actions)} actions from 1 request, exiting.")
             break
 
         if done or step >= max_steps:
@@ -433,13 +492,25 @@ def evaluate(
     seed: Optional[int] = None,
     augment_prompt: bool = False,
     num_rollouts: int = 10,
+    action_space: str = "relative",
+    direct_pos: bool = False,
+    wait_timeout: float = 600.0,
+    save_gifs: bool = False,
 ):
     """Run evaluation with multiple rollouts per episode for robustness."""
     # Create original diffusion_policy environment
     env = PushTEnv(legacy=True, render_size=96)
 
+    # Verify step_direct is available when requested
+    if direct_pos and not hasattr(env, "step_direct"):
+        raise RuntimeError(
+            "env.step_direct() not found — make sure you have the patched pusht_env.py "
+            "with step_direct() support."
+        )
+
     # Create client
-    client = SimpleInferenceClient(server_url=server_url)
+    client = SimpleInferenceClient(server_url=server_url, action_space=action_space)
+    client.wait_until_ready(timeout=wait_timeout)
 
     # Load dataset
     dataset_helper = None
@@ -463,6 +534,8 @@ def evaluate(
 
     print(f"Starting evaluation: {num_episodes} episodes x {num_rollouts} rollouts")
     print(f"Image size: {client.image_size}x{client.image_size}")
+    print(f"Action space: {action_space}")
+    print(f"Direct position control: {direct_pos}")
     print(f"Server URL: {server_url}")
     print(f"Output directory: {output_path}")
     print(f"Using original diffusion_policy environment")
@@ -498,12 +571,23 @@ def evaluate(
                         dataset_helper=dataset_helper,
                         debug_mode=debug_mode,
                         augment_prompt=augment_prompt,
+                        direct_pos=direct_pos,
                     )
 
                     if result["success"]:
                         episode_successes += 1
                         total_successes += 1
                     total_rollouts += 1
+
+                    video_paths = {}
+                    if save_gifs and result.get("frames"):
+                        env_gif_path = output_path / f"episode_{episode_idx:03d}_rollout_{rollout_idx:02d}_env.gif"
+                        save_gif(result["frames"], str(env_gif_path))
+                        video_paths["env_gif"] = str(env_gif_path)
+                    if save_gifs and result.get("server_frames"):
+                        model_gif_path = output_path / f"episode_{episode_idx:03d}_rollout_{rollout_idx:02d}_model.gif"
+                        save_gif(result["server_frames"], str(model_gif_path))
+                        video_paths["model_gif"] = str(model_gif_path)
 
                     # Save combined video (env | model) side by side
                     if result.get("frames") and result.get("server_frames"):
@@ -512,12 +596,18 @@ def evaluate(
                         )
                         video_path = output_path / f"episode_{episode_idx:03d}_rollout_{rollout_idx:02d}_combined.mp4"
                         save_video(combined_frames, str(video_path))
+                        video_paths["combined_mp4"] = str(video_path)
+                        if save_gifs:
+                            combined_gif_path = output_path / f"episode_{episode_idx:03d}_rollout_{rollout_idx:02d}_combined.gif"
+                            save_gif(combined_frames, str(combined_gif_path))
+                            video_paths["combined_gif"] = str(combined_gif_path)
 
                     episode_rollout_results.append({
                         "rollout": rollout_idx,
                         "success": result["success"],
                         "steps": result["steps"],
                         "final_coverage": result["final_coverage"],
+                        "videos": video_paths,
                     })
 
                     status = "SUCCESS" if result["success"] else "FAIL"
@@ -570,6 +660,9 @@ def evaluate(
     summary = {
         "domain_name": "pusht",
         "image_size": 96,
+        "action_space": action_space,
+        "direct_pos": direct_pos,
+        "save_gifs": save_gifs,
         "num_episodes": num_episodes,
         "num_rollouts_per_episode": num_rollouts,
         "total_rollouts": total_rollouts,
@@ -607,6 +700,13 @@ def main():
     parser.add_argument("--debug", action="store_true", help="Debug mode: run 1 action chunk only")
     parser.add_argument("--seed", type=int, default=9999, help="Random seed for reproducibility")
     parser.add_argument("--augment-prompt", action="store_true", help="Use augmented prompt with detailed task description")
+    parser.add_argument("--action-space", type=str, default="relative", choices=["relative", "absolute"],
+                        help="Action space: 'relative' (delta from agent pos) or 'absolute' (target position)")
+    parser.add_argument("--direct-pos", action="store_true",
+                        help="Bypass PID controller: set agent position directly. Use with --action-space absolute")
+    parser.add_argument("--wait-timeout", type=float, default=600.0,
+                        help="Seconds to wait for the model server health endpoint before rollouts")
+    parser.add_argument("--save-gifs", action="store_true", help="Also save GIF copies of rollout videos")
 
     args = parser.parse_args()
 
@@ -622,6 +722,10 @@ def main():
         seed=args.seed,
         augment_prompt=args.augment_prompt,
         num_rollouts=args.num_rollouts,
+        action_space=args.action_space,
+        direct_pos=args.direct_pos,
+        wait_timeout=args.wait_timeout,
+        save_gifs=args.save_gifs,
     )
 
 

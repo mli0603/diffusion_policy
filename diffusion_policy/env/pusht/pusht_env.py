@@ -121,7 +121,42 @@ class PushTEnv(gym.Env):
                 # Step physics.
                 self.space.step(dt)
 
-        # compute reward
+        return self._compute_step_result()
+
+    def step_direct(self, target_pos):
+        """Move agent directly to target position, bypassing the PID controller.
+
+        Smoothly interpolates the agent position over sub-steps so that
+        collisions with the block still register in pymunk.  The agent is
+        kinematic, so we can safely override position / velocity.
+
+        Use this when the policy predicts *states* (absolute positions)
+        rather than motor commands, to eliminate PID tracking error.
+        """
+        dt = 1.0 / self.sim_hz
+        self.n_contact_points = 0
+        n_steps = self.sim_hz // self.control_hz
+        if target_pos is not None:
+            self.latest_action = target_pos
+            start_pos = Vec2d(*self.agent.position)
+            end_pos = Vec2d(*target_pos)
+            for i in range(n_steps):
+                # Linearly interpolate position over sub-steps
+                alpha = (i + 1) / n_steps
+                new_pos = start_pos + (end_pos - start_pos) * alpha
+                # Set velocity consistent with the motion so pymunk computes
+                # collision impulses correctly for this kinematic body.
+                self.agent.velocity = (new_pos - Vec2d(*self.agent.position)) / dt
+                self.agent.position = new_pos
+                # Step physics — block responds to collisions with agent.
+                self.space.step(dt)
+            # Zero out residual velocity at the end of the step.
+            self.agent.velocity = Vec2d(0, 0)
+
+        return self._compute_step_result()
+
+    def _compute_step_result(self):
+        """Shared reward / observation logic used by step() and step_direct()."""
         goal_body = self._get_goal_pose_body(self.goal_pose)
         goal_geom = pymunk_to_shapely(goal_body, self.block.shapes)
         block_geom = pymunk_to_shapely(self.block, self.block.shapes)
