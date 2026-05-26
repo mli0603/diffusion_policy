@@ -1,7 +1,7 @@
 """Mock inference server for testing the PushT evaluation client.
 
 Supports two modes:
-1. Pattern mode: Returns fixed pattern actions (right, left, circle, etc.)
+1. Pattern mode: Returns fixed pattern actions (right, left, left_right, circle, etc.)
 2. Dataset mode: Replays actions from lerobot/pusht_image dataset
 
 Run with:
@@ -256,7 +256,9 @@ class MockInferenceHandler(BaseHTTPRequestHandler):
     action_format = "delta"  # "delta" or "absolute"
 
     def do_GET(self):
-        if self.path == "/info":
+        if self.path == "/":
+            self._handle_health()
+        elif self.path == "/info":
             self._handle_info()
         elif self.path.startswith("/episode/"):
             self._handle_episode_info()
@@ -270,6 +272,13 @@ class MockInferenceHandler(BaseHTTPRequestHandler):
             self._handle_reset()
         else:
             self.send_error(404, "Not Found")
+
+    def _handle_health(self):
+        """Return a lightweight readiness response."""
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps({"status": "ok"}).encode())
 
     def _handle_info(self):
         """Return server metadata."""
@@ -290,6 +299,7 @@ class MockInferenceHandler(BaseHTTPRequestHandler):
             info["current_frame"] = self.current_frame
         else:
             info["action_pattern"] = self.action_pattern
+            info["action_format"] = self.action_format
 
         self.wfile.write(json.dumps(info).encode())
 
@@ -425,7 +435,7 @@ class MockInferenceHandler(BaseHTTPRequestHandler):
             print(f"[MockServer] Failed to save image: {e}")
 
     def _generate_pattern_actions(self):
-        """Generate fixed pattern normalized delta actions (T, 2)."""
+        """Generate fixed pattern normalized actions (T, 2)."""
         T = self.chunk_size
         pattern = self.action_pattern
 
@@ -437,6 +447,18 @@ class MockInferenceHandler(BaseHTTPRequestHandler):
             actions = [[0.0, -0.1]] * T
         elif pattern == "down":
             actions = [[0.0, 0.1]] * T
+        elif pattern == "left_right":
+            if self.action_format == "absolute":
+                if MockInferenceHandler.request_count % 2 == 0:
+                    start_x, end_x = -0.7, 0.7
+                else:
+                    start_x, end_x = 0.7, -0.7
+                denom = max(T - 1, 1)
+                actions = [[start_x + (end_x - start_x) * i / denom, 0.0] for i in range(T)]
+            elif MockInferenceHandler.request_count % 2 == 0:
+                actions = [[0.1, 0.0]] * T
+            else:
+                actions = [[-0.1, 0.0]] * T
         elif pattern == "circle":
             import math
             actions = []
@@ -471,7 +493,7 @@ def run_server(
     Args:
         host: Server host
         port: Server port
-        pattern: Action pattern (right, left, up, down, circle, toward_goal)
+        pattern: Action pattern (right, left, up, down, left_right, circle, toward_goal)
         chunk_size: Number of actions per chunk (T)
         save_images: Whether to save received images to disk
         image_dir: Directory to save images
@@ -536,7 +558,7 @@ def main():
         "--pattern",
         type=str,
         default="right",
-        choices=["right", "left", "up", "down", "circle", "toward_goal", "none"],
+        choices=["right", "left", "up", "down", "left_right", "circle", "toward_goal", "none"],
         help="Action pattern to return (ignored in dataset mode)",
     )
     parser.add_argument("--chunk-size", type=int, default=16, help="Actions per chunk (T)")

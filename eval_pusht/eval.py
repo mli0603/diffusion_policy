@@ -580,6 +580,14 @@ def evaluate(
                     total_rollouts += 1
 
                     video_paths = {}
+                    if result.get("frames"):
+                        env_mp4_path = output_path / f"episode_{episode_idx:03d}_rollout_{rollout_idx:02d}_env.mp4"
+                        save_video(result["frames"], str(env_mp4_path))
+                        video_paths["env_mp4"] = str(env_mp4_path)
+                    if result.get("server_frames"):
+                        model_mp4_path = output_path / f"episode_{episode_idx:03d}_rollout_{rollout_idx:02d}_model.mp4"
+                        save_video(result["server_frames"], str(model_mp4_path))
+                        video_paths["model_mp4"] = str(model_mp4_path)
                     if save_gifs and result.get("frames"):
                         env_gif_path = output_path / f"episode_{episode_idx:03d}_rollout_{rollout_idx:02d}_env.gif"
                         save_gif(result["frames"], str(env_gif_path))
