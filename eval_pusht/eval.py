@@ -60,6 +60,24 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from diffusion_policy.env.pusht.pusht_env import PushTEnv
 
 
+def compute_pusht_coverage(env: PushTEnv) -> float:
+    """Compute current PushT block coverage against the goal."""
+    from shapely.geometry import MultiPolygon, Polygon
+
+    def get_block_geom(body: object, shapes: object) -> MultiPolygon:
+        geoms = []
+        for shape in shapes:
+            verts = [body.local_to_world(v) for v in shape.get_vertices()]
+            verts += [verts[0]]
+            geoms.append(Polygon(verts))
+        return MultiPolygon(geoms)
+
+    goal_body = env._get_goal_pose_body(env.goal_pose)
+    goal_geom = get_block_geom(goal_body, env.block.shapes)
+    block_geom = get_block_geom(env.block, env.block.shapes)
+    return float(goal_geom.intersection(block_geom).area / goal_geom.area)
+
+
 class SimpleInferenceClient:
     """Simple inference client for the mock server."""
 
@@ -96,7 +114,12 @@ class SimpleInferenceClient:
             pass
         return {}
 
-    def get_action_chunk(self, image: np.ndarray, prompt: str = "PushT task") -> tuple[np.ndarray, list[np.ndarray]]:
+    def get_action_chunk(
+        self,
+        image: np.ndarray,
+        prompt: str = "PushT task",
+        seed: int | None = None,
+    ) -> tuple[np.ndarray, list[np.ndarray]]:
         """Get action chunk from server.
         
         Returns:
@@ -121,15 +144,19 @@ class SimpleInferenceClient:
         buffer.seek(0)
         encoded = base64.b64encode(buffer.read()).decode("utf-8")
 
+        payload = {
+            "image": encoded,
+            "prompt": prompt,
+            "domain_name": "pusht",
+            "image_size": self.image_size,
+        }
+        if seed is not None:
+            payload["seed"] = int(seed)
+
         # Send request
         response = self.session.post(
             self.server_url,
-            json={
-                "image": encoded,
-                "prompt": prompt,
-                "domain_name": "pusht",
-                "image_size": self.image_size,
-            },
+            json=payload,
             timeout=self.timeout,
         )
         response.raise_for_status()
@@ -327,6 +354,7 @@ def run_episode(
     debug_mode: bool = False,
     augment_prompt: bool = False,
     direct_pos: bool = False,
+    policy_seed: int | None = None,
 ) -> dict:
     """Run a single episode.
 
@@ -376,6 +404,10 @@ def run_episode(
     success = False
     request_count = 0
     frame_idx = 0
+    initial_coverage = compute_pusht_coverage(env)
+    max_coverage = initial_coverage
+    max_coverage_step = 0
+    coverage_history = [initial_coverage]
 
     # Select the step function
     step_fn = env.step_direct if direct_pos else env.step
@@ -396,7 +428,8 @@ def run_episode(
         request_count += 1
 
         # Get action chunk from server (raw normalized actions in [-1, 1])
-        raw_actions, video_frames = client.get_action_chunk(obs_img, prompt=prompt)
+        request_seed = None if policy_seed is None else policy_seed + request_count - 1
+        raw_actions, video_frames = client.get_action_chunk(obs_img, prompt=prompt, seed=request_seed)
         # Skip the first frame (input image) as it duplicates the observation
         chunk_server_frames = video_frames[1:] if video_frames else []
         print(f"[Step {step}] Received {len(raw_actions)} actions from server (request #{request_count})")
@@ -414,6 +447,12 @@ def run_episode(
             obs, reward, done, info = step_fn(action)
             agent_pos = obs[:2]
             total_reward += reward
+            current_coverage = compute_pusht_coverage(env)
+            current_coverage_step = step + 1
+            coverage_history.append(current_coverage)
+            if current_coverage > max_coverage:
+                max_coverage = current_coverage
+                max_coverage_step = current_coverage_step
 
             # Record frame
             frame = env.render("rgb_array")
@@ -450,22 +489,7 @@ def run_episode(
         if done or step >= max_steps:
             break
 
-    # Calculate final coverage
-    from shapely.geometry import MultiPolygon, Polygon
-    import pymunk
-
-    def get_block_geom(body, shapes):
-        geoms = []
-        for shape in shapes:
-            verts = [body.local_to_world(v) for v in shape.get_vertices()]
-            verts += [verts[0]]
-            geoms.append(Polygon(verts))
-        return MultiPolygon(geoms)
-
-    goal_body = env._get_goal_pose_body(env.goal_pose)
-    goal_geom = get_block_geom(goal_body, env.block.shapes)
-    block_geom = get_block_geom(env.block, env.block.shapes)
-    coverage = goal_geom.intersection(block_geom).area / goal_geom.area
+    final_coverage = compute_pusht_coverage(env)
 
     return {
         "frames": frames,
@@ -475,7 +499,10 @@ def run_episode(
         "total_reward": total_reward,
         "success": success,
         "steps": step,
-        "final_coverage": coverage,
+        "final_coverage": final_coverage,
+        "max_coverage": max_coverage,
+        "max_coverage_step": max_coverage_step,
+        "coverage_history": coverage_history,
         "num_requests": request_count,
     }
 
@@ -485,6 +512,7 @@ def evaluate(
     num_episodes: int = 1,
     max_steps: int = 300,
     output_dir: str = "eval_results",
+    episode_start: int = 0,
     replay_dataset: bool = False,
     dataset_start_episode: int = 0,
     dataset_repo_id: str = "lerobot/pusht_image",
@@ -533,6 +561,7 @@ def evaluate(
     output_path.mkdir(parents=True, exist_ok=True)
 
     print(f"Starting evaluation: {num_episodes} episodes x {num_rollouts} rollouts")
+    print(f"Episode start: {episode_start}")
     print(f"Image size: {client.image_size}x{client.image_size}")
     print(f"Action space: {action_space}")
     print(f"Direct position control: {direct_pos}")
@@ -548,6 +577,7 @@ def evaluate(
 
     try:
         for episode_idx in range(num_episodes):
+            global_episode_idx = episode_start + episode_idx
             dataset_episode_idx = None
             if replay_dataset:
                 dataset_episode_idx = dataset_start_episode + episode_idx
@@ -557,10 +587,13 @@ def evaluate(
 
             for rollout_idx in range(num_rollouts):
                 # Set different seed for each rollout while maintaining reproducibility
+                env_seed = None
+                policy_seed = None
                 if seed is not None:
-                    rollout_seed = seed + episode_idx * num_rollouts + rollout_idx
-                    set_seed(rollout_seed)
-                    env.seed(rollout_seed)  # Seed environment's internal RNG
+                    env_seed = seed + global_episode_idx
+                    policy_seed = seed + global_episode_idx * num_rollouts + rollout_idx
+                    set_seed(policy_seed)
+                    env.seed(env_seed)  # Seed environment's internal RNG
 
                 try:
                     result = run_episode(
@@ -572,6 +605,7 @@ def evaluate(
                         debug_mode=debug_mode,
                         augment_prompt=augment_prompt,
                         direct_pos=direct_pos,
+                        policy_seed=policy_seed,
                     )
 
                     if result["success"]:
@@ -612,16 +646,24 @@ def evaluate(
 
                     episode_rollout_results.append({
                         "rollout": rollout_idx,
+                        "episode_seed": env_seed,
+                        "policy_seed": policy_seed,
                         "success": result["success"],
                         "steps": result["steps"],
+                        "max_coverage": result["max_coverage"],
+                        "max_coverage_step": result["max_coverage_step"],
                         "final_coverage": result["final_coverage"],
+                        "coverage_history": result["coverage_history"],
                         "videos": video_paths,
                     })
 
                     status = "SUCCESS" if result["success"] else "FAIL"
                     print(
-                        f"Episode {episode_idx + 1}/{num_episodes}, Rollout {rollout_idx + 1}/{num_rollouts}: {status} | "
-                        f"Steps: {result['steps']} | Coverage: {result['final_coverage']:.2%}"
+                        f"Episode {global_episode_idx} ({episode_idx + 1}/{num_episodes}), "
+                        f"Rollout {rollout_idx + 1}/{num_rollouts}: {status} | "
+                        f"Steps: {result['steps']} | "
+                        f"Peak Coverage: {result['max_coverage']:.2%} @ step {result['max_coverage_step']} | "
+                        f"Final Coverage: {result['final_coverage']:.2%}"
                     )
 
                 except Exception as e:
@@ -631,19 +673,27 @@ def evaluate(
 
             # Aggregate rollout results for this episode
             if episode_rollout_results:
-                coverages = [r["final_coverage"] for r in episode_rollout_results]
+                coverages = [r["max_coverage"] for r in episode_rollout_results]
+                final_coverages = [r["final_coverage"] for r in episode_rollout_results]
                 steps_list = [r["steps"] for r in episode_rollout_results]
                 episode_success_rate = episode_successes / len(episode_rollout_results)
                 
                 results.append({
-                    "episode": episode_idx,
+                    "episode": global_episode_idx,
+                    "local_episode": episode_idx,
+                    "episode_seed": seed + global_episode_idx if seed is not None else None,
                     "num_rollouts": len(episode_rollout_results),
+                    "coverage_metric": "max_coverage",
                     "success_rate": episode_success_rate,
                     "successes": episode_successes,
                     "mean_coverage": float(np.mean(coverages)),
                     "std_coverage": float(np.std(coverages)),
                     "min_coverage": float(np.min(coverages)),
                     "max_coverage": float(np.max(coverages)),
+                    "mean_final_coverage": float(np.mean(final_coverages)),
+                    "std_final_coverage": float(np.std(final_coverages)),
+                    "min_final_coverage": float(np.min(final_coverages)),
+                    "max_final_coverage": float(np.max(final_coverages)),
                     "mean_steps": float(np.mean(steps_list)),
                     "std_steps": float(np.std(steps_list)),
                     "rollouts": episode_rollout_results,
@@ -652,7 +702,8 @@ def evaluate(
                 print(
                     f"  >> Episode {episode_idx + 1} Summary: "
                     f"Success Rate: {episode_success_rate:.1%} | "
-                    f"Coverage: {np.mean(coverages):.2%} ± {np.std(coverages):.2%}"
+                    f"Peak Coverage: {np.mean(coverages):.2%} ± {np.std(coverages):.2%} | "
+                    f"Final Coverage: {np.mean(final_coverages):.2%} ± {np.std(final_coverages):.2%}"
                 )
 
     finally:
@@ -661,8 +712,11 @@ def evaluate(
     # Summary
     overall_success_rate = total_successes / total_rollouts if total_rollouts > 0 else 0
     all_coverages = [r["mean_coverage"] for r in results] if results else []
+    all_final_coverages = [r["mean_final_coverage"] for r in results] if results else []
     avg_coverage = np.mean(all_coverages) if all_coverages else 0
     std_coverage = np.std(all_coverages) if all_coverages else 0
+    avg_final_coverage = np.mean(all_final_coverages) if all_final_coverages else 0
+    std_final_coverage = np.std(all_final_coverages) if all_final_coverages else 0
 
     # Save results to JSON
     summary = {
@@ -671,6 +725,8 @@ def evaluate(
         "action_space": action_space,
         "direct_pos": direct_pos,
         "save_gifs": save_gifs,
+        "coverage_metric": "max_coverage",
+        "episode_start": episode_start,
         "num_episodes": num_episodes,
         "num_rollouts_per_episode": num_rollouts,
         "total_rollouts": total_rollouts,
@@ -678,6 +734,8 @@ def evaluate(
         "total_successes": total_successes,
         "avg_coverage": float(avg_coverage),
         "std_coverage": float(std_coverage),
+        "avg_final_coverage": float(avg_final_coverage),
+        "std_final_coverage": float(std_final_coverage),
         "seed": seed,
         "server_url": server_url,
         "max_steps": max_steps,
@@ -690,7 +748,8 @@ def evaluate(
 
     print("-" * 50)
     print(f"Overall Success Rate: {overall_success_rate:.2%} ({total_successes}/{total_rollouts})")
-    print(f"Average Coverage: {avg_coverage:.2%} ± {std_coverage:.2%}")
+    print(f"Average Peak Coverage: {avg_coverage:.2%} ± {std_coverage:.2%}")
+    print(f"Average Final Coverage: {avg_final_coverage:.2%} ± {std_final_coverage:.2%}")
     print(f"Results saved to: {output_path}")
     print(f"JSON results: {json_path}")
 
@@ -702,6 +761,8 @@ def main():
     parser.add_argument("--num-rollouts", type=int, default=10, help="Number of rollouts per episode for robustness")
     parser.add_argument("--max-steps", type=int, default=300)
     parser.add_argument("--output-dir", type=str, default="eval_results")
+    parser.add_argument("--episode-start", type=int, default=0,
+                        help="Global episode index for sharded evaluations")
     parser.add_argument("--replay-dataset", action="store_true")
     parser.add_argument("--dataset-start-episode", type=int, default=0)
     parser.add_argument("--dataset-repo-id", type=str, default="lerobot/pusht_image")
@@ -723,6 +784,7 @@ def main():
         num_episodes=args.num_episodes,
         max_steps=args.max_steps,
         output_dir=args.output_dir,
+        episode_start=args.episode_start,
         replay_dataset=args.replay_dataset,
         dataset_start_episode=args.dataset_start_episode,
         dataset_repo_id=args.dataset_repo_id,
